@@ -269,11 +269,14 @@ impl KarakeepClient {
             .await?;
         if exact.status() != reqwest::StatusCode::NOT_FOUND {
             let exact = parse_response(exact).await?;
-            return match exact.get("bookmarkId") {
-                Some(Value::Null) => Ok(None),
-                Some(Value::String(id)) => Ok(Some(id.clone())),
+            match exact.get("bookmarkId") {
+                // Some Karakeep versions miss a stored bare origin after adding
+                // a trailing slash to their lookup. Check normalized URL equality
+                // through the compatibility path before creating a bookmark.
+                Some(Value::Null) => {}
+                Some(Value::String(id)) => return Ok(Some(id.clone())),
                 _ => anyhow::bail!("Invalid exact-URL lookup response"),
-            };
+            }
         }
         // Compatibility for Karakeep versions that predate exact-URL lookup.
         let url = format!("{}/api/v1/bookmarks/search", self.url);
@@ -994,5 +997,47 @@ mod large_original_tests {
             .await
             .unwrap();
         assert!(KarakeepClient::bounded_bytes(response).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod normalized_origin_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    #[tokio::test]
+    async fn bare_origin_missed_by_exact_api_is_not_resaved_with_a_trailing_slash() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/check-url"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"bookmarkId":null})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"bookmarks":[{"id":"existing","content":{"url":"https://example.com"}}]}),
+            ))
+            .mount(&server)
+            .await;
+        let client = KarakeepClient::new(&server.uri(), "test-token");
+        assert_eq!(
+            client
+                .check_exists_bookmark("https://example.com/")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("existing")
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method == Method::GET)
+        );
     }
 }

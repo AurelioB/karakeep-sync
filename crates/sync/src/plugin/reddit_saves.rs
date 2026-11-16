@@ -52,7 +52,9 @@ impl super::Plugin for RedditSaves {
                     .map(|post| BookmarkCreate {
                         title: post.title,
                         url: post.url,
-                        // Reddt does not provide timestamp for when the post was saved
+                        metadata: post.metadata,
+                        tags: post.tags,
+                        // Reddit does not expose save timestamps.
                         created_at: None,
                         ..Default::default()
                     })
@@ -66,9 +68,7 @@ impl super::Plugin for RedditSaves {
     }
 
     async fn sync(&self) -> anyhow::Result<i32> {
-        if !settings::get_settings().reddit.previews {
-            return super::sync_with_client(self, crate::karakeep::get_client()).await;
-        }
+        let _guard = super::SYNC_LOCK.lock().await;
         let reddit = authenticated().await?;
         let karakeep = crate::karakeep::get_client();
         karakeep.refresh_bookmarks().await?;
@@ -79,16 +79,24 @@ impl super::Plugin for RedditSaves {
         let mut rank = 0_i64;
         let mut created = 0;
         let mut previews = 0;
+        let mut visited = std::collections::HashSet::new();
         loop {
             let page = reddit.list_saved(after.as_deref()).await?;
             for post in page.posts {
                 if post.preview_image.is_some() {
                     previews += 1;
                 }
+                visited.insert(karakeep_client::bookmark_key(&post.url));
                 let bookmark = BookmarkCreate {
                     title: post.title,
                     url: post.url,
-                    preview_image: post.preview_image,
+                    metadata: post.metadata,
+                    tags: post.tags,
+                    preview_image: if settings::get_settings().reddit.previews {
+                        post.preview_image
+                    } else {
+                        None
+                    },
                     // Reddit has no save timestamp. Preserve listing order for new saves;
                     // existing bookmarks, including repaired dates, are never re-dated.
                     created_at: Some((anchor - chrono::Duration::seconds(rank)).to_rfc3339()),
@@ -102,6 +110,49 @@ impl super::Plugin for RedditSaves {
             anyhow::ensure!(
                 seen.insert(cursor.clone()),
                 "Reddit repeated a saved-items cursor"
+            );
+        }
+        if std::env::args().any(|a| a == "--backfill") {
+            let older = karakeep.list_bookmarks(Some(&list)).await?;
+            let mut ids = std::collections::BTreeSet::new();
+            for row in older {
+                let Some(url) = row["content"]["url"].as_str() else {
+                    continue;
+                };
+                let key = karakeep_client::bookmark_key(url);
+                if visited.contains(&key) {
+                    continue;
+                }
+                if let Some(fullname) = reddit_fullname(&key) {
+                    ids.insert(fullname);
+                }
+            }
+            let ids: Vec<_> = ids.into_iter().collect();
+            let mut found = 0;
+            for batch in ids.chunks(100) {
+                let posts = reddit.posts_by_ids(batch).await?;
+                for post in posts {
+                    let bookmark = BookmarkCreate {
+                        title: post.title,
+                        url: post.url,
+                        metadata: post.metadata,
+                        tags: post.tags,
+                        preview_image: if settings::get_settings().reddit.previews {
+                            post.preview_image
+                        } else {
+                            None
+                        },
+                        // Backfilling an older item must never invent a new saved date.
+                        created_at: None,
+                    };
+                    karakeep.upsert(&bookmark, &list).await?;
+                    found += 1;
+                }
+            }
+            tracing::info!(
+                "Reddit older-item backfill complete (requested={}, returned={})",
+                ids.len(),
+                found
             );
         }
         tracing::info!(
@@ -151,4 +202,28 @@ async fn authenticated() -> anyhow::Result<reddit_client::RedditClient> {
             .context("Reddit username is not set")?,
     )
     .await
+}
+
+fn reddit_fullname(key: &str) -> Option<String> {
+    let parts: Vec<_> = key.strip_prefix("reddit:")?.split(':').collect();
+    let raw = if parts.len() == 2 { parts[1] } else { parts[0] };
+    if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(format!(
+        "{}_{}",
+        if parts.len() == 2 { "t1" } else { "t3" },
+        raw
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn older_post_and_comment_urls_use_their_distinct_reddit_ids() {
+        assert_eq!(reddit_fullname("reddit:abc").as_deref(), Some("t3_abc"));
+        assert_eq!(reddit_fullname("reddit:abc:def").as_deref(), Some("t1_def"));
+        assert!(reddit_fullname("https://example.com").is_none());
+    }
 }

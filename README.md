@@ -80,7 +80,7 @@ GitHub stars will be synced to a list named `GitHub Starred` in your Karakeep in
 
 Set `KS_GITHUB_SYNCLISTS=true` to also import the authenticated user's GitHub star lists through the GraphQL API. Each source list becomes a child of `GitHub Starred`, using its original name. Bookmarks also remain directly in `GitHub Starred`. A repository can belong to multiple child lists.
 
-List imports paginate every source list and its repositories on each run. They reuse existing bookmarks by URL and add memberships even when the flat import stops after five existing bookmarks. This also distributes stars imported before the option was enabled. On first import, an untracked child with the same name and parent is reused. Lists elsewhere in Karakeep are not reused or moved.
+List imports paginate every source list and its repositories on each run. They reuse existing bookmarks by URL and add memberships alongside the full metadata pass. This also distributes stars imported before the option was enabled. On first import, an untracked child with the same name and parent is reused. Lists elsewhere in Karakeep are not reused or moved.
 
 Each imported child stores its GitHub list ID in a `karakeep-sync-source: github-list:<id>` line in its description. Existing description text is preserved. Keep this metadata line so source renames update the same Karakeep child without changing its ID or memberships. Names are not used to identify a list after it is linked to GitHub.
 
@@ -187,3 +187,47 @@ environment:
 volumes:
   - ./sync-data:/data
 ```
+
+## Native GitHub and Reddit metadata
+
+Every GitHub and Reddit sync scans all pages, including existing bookmarks. Native
+fields are updated only when their source values differ; an unchanged second pass
+makes no metadata or tag writes. Notes, summaries, archive/favourite flags, and existing
+tags are never replaced. Source tags are additive and case-insensitive when matching.
+Private original metadata is saved under `/data/metadata-before` before the first change.
+
+| Karakeep field | GitHub | Reddit |
+| --- | --- | --- |
+| Title | Repository name with owner | Post title; parent post title for saved comments |
+| Description | Repository description | Post text or comment excerpt, up to 1,000 characters |
+| Author | Repository owner | Post/comment author, when available |
+| Publisher | GitHub | Reddit, including the subreddit |
+| Publication date | Repository creation | Post/comment creation |
+| Modification date | Last push | Numeric edit timestamp, when provided |
+| Saved date | Actual `starredAt` from GitHub | Existing date preserved; new saves use synthetic listing order |
+| Tags | Topics, primary language, SPDX license | Subreddit (`r/name`) and post flair |
+| Banner | GitHub Open Graph image | Reddit preview/gallery/thumbnail |
+
+GitHub's GraphQL star edges expose the actual star timestamp independently of the
+repository's creation date. The full pass also retrieves metadata for older saved
+repository URLs, follows GitHub's rename/transfer identity, and reuses existing
+Karakeep bookmark IDs in child lists. Saved repositories no longer in the current
+star response keep their saved date: GitHub cannot supply a past star event after
+it has been removed. Missing/private/deleted repositories are left intact.
+
+Existing GitHub banners are reused when already sourced from the same Open Graph
+image (the default image's changing cache hash is ignored). Replacements use the
+same bounded upload, private backup, and custom-cover protection as Reddit.
+
+To backfill Reddit bookmarks older than the saved-list API returns, run:
+
+```sh
+karakeep-sync --once reddit --backfill
+```
+
+This resolves the post/comment IDs from the existing Reddit Saved list through
+Reddit's `/api/info`, in batches of up to 100. It requires `read` scope in addition
+to `history` (reconnect once if necessary). It never infers a saved date from a
+post's publication date. Items Reddit cannot return retain their current metadata.
+Normal scheduled runs refresh the saved listing; the explicit older-item backfill
+can be repeated safely. No metadata is written into notes.

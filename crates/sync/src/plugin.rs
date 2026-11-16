@@ -10,6 +10,10 @@ use futures::{Stream, StreamExt};
 use karakeep_client::{BookmarkCreate, KarakeepClient};
 use std::pin::Pin;
 
+// A full metadata pass refreshes the shared URL index and may add repository aliases.
+// Serialize source passes so another refresh cannot discard aliases mid-import.
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[async_trait]
 pub trait Plugin: Send + Sync + 'static {
     fn list_name(&self) -> &'static str;
@@ -30,6 +34,7 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     async fn sync(&self) -> anyhow::Result<i32> {
+        let _guard = SYNC_LOCK.lock().await;
         sync_with_client(self, karakeep::get_client()).await
     }
 }

@@ -97,6 +97,8 @@ pub struct ListingChildData {
 #[derive(Debug)]
 pub struct SavedPost {
     pub preview_image: Option<String>,
+    pub metadata: serde_json::Value,
+    pub tags: Vec<String>,
     pub title: String,
     pub url: String,
 }
@@ -108,6 +110,23 @@ pub struct ListSavedResponse {
 }
 
 impl RedditClient {
+    /// Requires Reddit's `read` scope in addition to the saved-list `history` scope.
+    pub async fn posts_by_ids(&self, ids: &[String]) -> anyhow::Result<Vec<SavedPost>> {
+        anyhow::ensure!(ids.len() <= 100, "Reddit info batch exceeds 100 items");
+        let response = self
+            .client
+            .get(format!("{APP_URL}/api/info"))
+            .bearer_auth(&self.access_token)
+            .query(&[("id", ids.join(",")), ("raw_json", "1".into())])
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status() != reqwest::StatusCode::FORBIDDEN,
+            "Older Reddit item metadata requires reconnecting Reddit with the read scope"
+        );
+        let listing: ListingResponse = response.error_for_status()?.json().await?;
+        Ok(listing.data.children.into_iter().map(saved_post).collect())
+    }
     pub async fn list_saved(&self, after: Option<&str>) -> anyhow::Result<ListSavedResponse> {
         let mut req = self
             .client
@@ -132,16 +151,7 @@ impl RedditClient {
             .data
             .children
             .into_iter()
-            .map(|child| {
-                let data = child.data;
-                SavedPost {
-                    preview_image: preview_image(&serde_json::Value::Object(data.metadata)),
-                    title: data
-                        .title
-                        .unwrap_or_else(|| "(unknown title reddit post)".to_string()),
-                    url: format!("https://reddit.com{}", data.permalink),
-                }
-            })
+            .map(saved_post)
             .collect::<Vec<_>>();
 
         Ok({
@@ -150,6 +160,65 @@ impl RedditClient {
                 after: resp.data.after,
             }
         })
+    }
+}
+
+fn saved_post(child: ListingChild) -> SavedPost {
+    use serde_json::{Value, json};
+    let data = child.data;
+    let meta = Value::Object(data.metadata);
+    let title = data
+        .title
+        .or_else(|| meta["link_title"].as_str().map(str::to_owned));
+    let mut metadata = json!({});
+    if let Some(title) = &title {
+        metadata["title"] = title.chars().take(1000).collect::<String>().into();
+    }
+    if let Some(author) = meta["author"]
+        .as_str()
+        .filter(|s| !s.is_empty() && *s != "[deleted]")
+    {
+        metadata["author"] = author.into();
+    }
+    let subreddit = meta["subreddit"].as_str().filter(|s| !s.is_empty());
+    metadata["publisher"] = subreddit
+        .map(|s| format!("Reddit · r/{s}"))
+        .unwrap_or_else(|| "Reddit".into())
+        .into();
+    let text = if child.kind == "t1" {
+        &meta["body"]
+    } else {
+        &meta["selftext"]
+    };
+    if let Some(text) = text
+        .as_str()
+        .filter(|s| !s.trim().is_empty() && !["[removed]", "[deleted]"].contains(s))
+    {
+        metadata["description"] = text.chars().take(1000).collect::<String>().into();
+    }
+    for (field, source) in [("datePublished", "created_utc"), ("dateModified", "edited")] {
+        if let Some(seconds) = meta[source].as_f64().filter(|v| v.is_finite() && *v > 0.0) {
+            if let Some(date) = chrono::DateTime::from_timestamp(seconds as i64, 0) {
+                metadata[field] = date.to_rfc3339().into();
+            }
+        }
+    }
+    let mut tags = vec![];
+    if let Some(sub) = subreddit {
+        tags.push(format!("r/{sub}"));
+    }
+    if let Some(flair) = meta["link_flair_text"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+    {
+        tags.push(flair.chars().take(100).collect());
+    }
+    SavedPost {
+        preview_image: preview_image(&meta),
+        metadata,
+        tags,
+        title: title.unwrap_or_else(|| "(unknown title reddit post)".into()),
+        url: format!("https://reddit.com{}", data.permalink),
     }
 }
 
@@ -275,5 +344,43 @@ mod tests {
                 .as_deref(),
             Some("https://b.thumbs.redditmedia.com/post.jpg")
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn saved_comment_has_parent_title_comment_author_and_publication_time_but_no_save_time() {
+        let child: ListingChild = serde_json::from_value(json!({"kind":"t1","data":{
+            "permalink":"/r/test/comments/abc/title/def/","link_title":"The parent post",
+            "body":"Useful comment","author":"writer","subreddit":"test","created_utc":1609459200.0,"edited":false
+        }})).unwrap();
+        let comment = saved_post(child);
+        assert_eq!(comment.title, "The parent post");
+        assert_eq!(comment.metadata["author"], "writer");
+        assert_eq!(comment.metadata["description"], "Useful comment");
+        assert_eq!(
+            comment.metadata["datePublished"],
+            "2021-01-01T00:00:00+00:00"
+        );
+        assert!(comment.metadata.get("dateModified").is_none());
+        assert!(comment.metadata.get("createdAt").is_none());
+        assert!(comment.metadata.get("note").is_none());
+        assert_eq!(comment.tags, vec!["r/test"]);
+    }
+    #[test]
+    fn deleted_content_does_not_erase_metadata_and_numeric_edit_time_is_separate() {
+        let child: ListingChild = serde_json::from_value(json!({"kind":"t3","data":{
+            "title":"Post","permalink":"/r/test/comments/abc/title/","author":"[deleted]",
+            "selftext":"[removed]","link_flair_text":"Discussion","edited":1609459200
+        }}))
+        .unwrap();
+        let post = saved_post(child);
+        assert!(post.metadata.get("author").is_none());
+        assert!(post.metadata.get("description").is_none());
+        assert_eq!(post.metadata["dateModified"], "2021-01-01T00:00:00+00:00");
+        assert_eq!(post.tags, vec!["Discussion"]);
     }
 }

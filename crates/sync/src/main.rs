@@ -48,6 +48,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let args: Vec<_> = std::env::args().collect();
+    anyhow::ensure!(
+        !args.iter().any(|a| a == "--backfill") || args.iter().any(|a| a == "--once"),
+        "Use --once reddit --backfill for the older-item backfill"
+    );
     if let Some(index) = args.iter().position(|arg| arg == "--once") {
         let selected = args.get(index + 1).map(String::as_str).unwrap_or("all");
         anyhow::ensure!(

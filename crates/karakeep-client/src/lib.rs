@@ -32,6 +32,9 @@ pub struct BookmarkCreate {
     pub url: String,
     pub created_at: Option<String>,
     pub preview_image: Option<String>,
+    /// Only native metadata fields; notes and user flags are never accepted here.
+    pub metadata: Value,
+    pub tags: Vec<String>,
 }
 
 async fn parse_response(resp: Response) -> anyhow::Result<Value> {
@@ -93,6 +96,71 @@ pub fn reddit_image_url(raw: &str) -> Option<Url> {
     .then_some(url)
 }
 
+pub fn source_image_url(raw: &str) -> Option<Url> {
+    reddit_image_url(raw).or_else(|| {
+        let url = Url::parse(raw).ok()?;
+        (url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port_or_known_default() == Some(443)
+            && matches!(
+                url.host_str()?,
+                "opengraph.githubassets.com"
+                    | "repository-images.githubusercontent.com"
+                    | "user-images.githubusercontent.com"
+            ))
+        .then_some(url)
+    })
+}
+
+fn metadata_patch(row: &Value, metadata: &Value) -> anyhow::Result<Value> {
+    let mut patch = serde_json::Map::new();
+    if metadata.is_null() {
+        return Ok(Value::Object(patch));
+    }
+    let fields = metadata
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Invalid metadata"))?;
+    for (key, value) in fields {
+        anyhow::ensure!(
+            matches!(
+                key.as_str(),
+                "title"
+                    | "description"
+                    | "author"
+                    | "publisher"
+                    | "datePublished"
+                    | "dateModified"
+                    | "createdAt"
+            ),
+            "Field is not source metadata: {key}"
+        );
+        let Some(text) = value.as_str().filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        let old = if matches!(key.as_str(), "title" | "createdAt") {
+            &row[key]
+        } else {
+            &row["content"][key]
+        };
+        let equal = old == value
+            || (matches!(key.as_str(), "datePublished" | "dateModified" | "createdAt")
+                && old.as_str().is_some_and(|old| {
+                    match (
+                        chrono::DateTime::parse_from_rfc3339(old),
+                        chrono::DateTime::parse_from_rfc3339(text),
+                    ) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => false,
+                    }
+                }));
+        if !equal {
+            patch.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::Object(patch))
+}
+
 pub fn write_private_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     std::fs::create_dir_all(
         path.parent()
@@ -140,7 +208,7 @@ impl KarakeepClient {
             .timeout(Duration::from_secs(40))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 5
-                    || reddit_image_url(attempt.url().as_str()).is_none()
+                    || source_image_url(attempt.url().as_str()).is_none()
                 {
                     attempt.stop()
                 } else {
@@ -172,13 +240,28 @@ impl KarakeepClient {
         path: &str,
         body: Option<&Value>,
     ) -> anyhow::Result<Value> {
-        let mut request = self
-            .client
-            .request(method, format!("{}/api/v1{path}", self.url));
-        if let Some(body) = body {
-            request = request.json(body);
+        for attempt in 0..4 {
+            let mut request = self
+                .client
+                .request(method.clone(), format!("{}/api/v1{path}", self.url));
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().await?;
+            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == 3 {
+                return parse_response(response).await;
+            }
+            let delay = response
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30)
+                .clamp(1, 60);
+            tracing::warn!("Karakeep rate limit; pausing metadata requests");
+            tokio::time::sleep(Duration::from_secs(delay)).await;
         }
-        parse_response(request.send().await?).await
+        unreachable!()
     }
     pub async fn lists(&self) -> anyhow::Result<Vec<Value>> {
         let value = self.request(Method::GET, "/lists", None).await?;
@@ -227,6 +310,13 @@ impl KarakeepClient {
         }
         *index = Some(map);
         Ok(())
+    }
+    pub async fn alias_bookmark(&self, original: &str, canonical: &str) {
+        if let Some(index) = self.index.lock().await.as_mut() {
+            if let Some(row) = index.get(&bookmark_key(original)).cloned() {
+                index.entry(bookmark_key(canonical)).or_insert(row);
+            }
+        }
     }
     pub async fn create_bookmark(&self, bookmark: &BookmarkCreate) -> anyhow::Result<String> {
         let api_url = format!("{}/api/v1/bookmarks", self.url);
@@ -452,7 +542,18 @@ impl KarakeepClient {
     ) -> anyhow::Result<bool> {
         // Check if bookmark exists by URL
         tracing::debug!("checking if bookmark exists: {}", &bookmark.url);
-        let exists = self.check_exists_bookmark(&bookmark.url).await?;
+        let cached = self
+            .index
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|index| index.get(&bookmark_key(&bookmark.url)))
+            .and_then(|row| row["id"].as_str())
+            .map(str::to_owned);
+        let exists = match cached {
+            Some(id) => Some(id),
+            None => self.check_exists_bookmark(&bookmark.url).await?,
+        };
         let to_create = exists.is_none();
         tracing::debug!("bookmark exists: {}", !to_create);
 
@@ -479,7 +580,7 @@ impl KarakeepClient {
             self.refresh_bookmarks().await?;
         }
         let key = bookmark_key(&bookmark.url);
-        let (row, created) = {
+        let (mut row, created) = {
             let mut guard = self.index.lock().await;
             let index = guard.as_mut().unwrap();
             if let Some(row) = index.get(&key) {
@@ -498,13 +599,78 @@ impl KarakeepClient {
         };
         let bookmark_id = id(&row)?;
         self.ensure_bookmark_in_list(&bookmark_id, list).await?;
+        row = self
+            .sync_metadata(&row, &bookmark.metadata, &bookmark.tags)
+            .await?;
         if let Some(image) = &bookmark.preview_image {
             if let Err(error) = self.sync_preview(&row, image).await {
                 // A failed image must not stop the saved-post import or mutate dates.
-                tracing::warn!(bookmark=%bookmark_id,"Reddit preview deferred: {error}");
+                tracing::warn!(bookmark=%bookmark_id,"Source preview deferred: {error}");
             }
         }
         Ok((bookmark_id, created))
+    }
+    pub async fn sync_metadata(
+        &self,
+        row: &Value,
+        metadata: &Value,
+        tags: &[String],
+    ) -> anyhow::Result<Value> {
+        let patch = metadata_patch(row, metadata)?;
+        let mut names = std::collections::BTreeMap::new();
+        for name in tags.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            names.entry(name.to_lowercase()).or_insert(name);
+        }
+        let current: std::collections::HashSet<_> = row["tags"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str())
+            .map(str::to_lowercase)
+            .collect();
+        let missing: Vec<_> = names
+            .into_iter()
+            .filter(|(key, _)| !current.contains(key))
+            .map(|(_, name)| json!({"tagName":name}))
+            .collect();
+        if patch.as_object().unwrap().is_empty() && missing.is_empty() {
+            return Ok(row.clone());
+        }
+        let bookmark_id = id(row)?;
+        let backup = self
+            .state_path("metadata-before")
+            .join(format!("{bookmark_id}.json"));
+        if !backup.exists() {
+            write_private_json(&backup, row)?;
+        }
+        let mut updated = if !patch.as_object().unwrap().is_empty() {
+            self.request(
+                Method::PATCH,
+                &format!("/bookmarks/{bookmark_id}"),
+                Some(&patch),
+            )
+            .await?
+        } else {
+            row.clone()
+        };
+        if !missing.is_empty() {
+            self.request(
+                Method::POST,
+                &format!("/bookmarks/{bookmark_id}/tags"),
+                Some(&json!({"tags":missing})),
+            )
+            .await?;
+            updated = self
+                .request(Method::GET, &format!("/bookmarks/{bookmark_id}"), None)
+                .await?;
+        }
+        if let Some(cache) = self.index.lock().await.as_mut() {
+            for entry in cache.values_mut().filter(|entry| entry["id"] == row["id"]) {
+                *entry = updated.clone();
+            }
+        }
+        tracing::info!(bookmark=%bookmark_id, "Source metadata updated");
+        Ok(updated)
     }
     async fn bounded_bytes(mut response: Response) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
@@ -564,12 +730,39 @@ impl KarakeepClient {
         Ok(())
     }
     pub async fn sync_preview(&self, row: &Value, image: &str) -> anyhow::Result<bool> {
-        let Some(url) = reddit_image_url(image) else {
+        let Some(url) = source_image_url(image) else {
             anyhow::bail!("Invalid Reddit preview URL")
         };
         let bookmark_id = id(row)?;
         let mut last_upload = self.previews.lock().await;
-        let path = self.state_path("reddit-previews.json");
+        let github = reddit_image_url(image).is_none();
+        let prefix = if github {
+            "github-preview"
+        } else {
+            "reddit-preview"
+        };
+        let path = self.state_path(&format!("{prefix}s.json"));
+        // Karakeep already crawls GitHub reliably. Reuse the same native banner,
+        // including its downloaded asset, instead of uploading an identical copy.
+        if github {
+            let old = row["content"]["imageUrl"]
+                .as_str()
+                .and_then(|s| Url::parse(s).ok());
+            let same = old.as_ref().is_some_and(|old| {
+                old == &url
+                    || (old.host_str() == Some("opengraph.githubassets.com")
+                        && url.host_str() == old.host_str()
+                        && old
+                            .path_segments()
+                            .map(|s| s.rev().take(2).collect::<Vec<_>>())
+                            == url
+                                .path_segments()
+                                .map(|s| s.rev().take(2).collect::<Vec<_>>()))
+            });
+            if same {
+                return Ok(false);
+            }
+        }
         let mut state = read_state(&path)?;
         let current = row["content"]["imageAssetId"].as_str();
         let recorded = &state[&bookmark_id];
@@ -587,7 +780,9 @@ impl KarakeepClient {
             if assets.iter().any(|asset| {
                 asset["id"].as_str() == current
                     && asset["fileName"].as_str().is_some_and(|name| {
-                        !name.is_empty() && !name.starts_with("reddit-preview.")
+                        !name.is_empty()
+                            && !name.starts_with("reddit-preview.")
+                            && !name.starts_with("github-preview.")
                     })
             }) {
                 tracing::info!(bookmark=%bookmark_id,"Keeping the owner's custom preview");
@@ -626,7 +821,7 @@ impl KarakeepClient {
             tokio::time::sleep(wait).await;
         }
         let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(format!("reddit-preview.{ext}"))
+            .file_name(format!("{prefix}.{ext}"))
             .mime_str(mime)?;
         let response = self
             .client
@@ -652,7 +847,7 @@ impl KarakeepClient {
         state[&bookmark_id]["pending"] = false.into();
         write_private_json(&path, &state)?;
         self.cache_preview(row, new_asset).await;
-        tracing::info!(bookmark=%bookmark_id,"Reddit preview installed");
+        tracing::info!(bookmark=%bookmark_id,"Source preview installed");
         Ok(true)
     }
     async fn attach_preview(
@@ -674,7 +869,9 @@ impl KarakeepClient {
             assets.iter().any(|a| {
                 a["id"].as_str() == current
                     && a["fileName"].as_str().is_some_and(|name| {
-                        !name.is_empty() && !name.starts_with("reddit-preview.")
+                        !name.is_empty()
+                            && !name.starts_with("reddit-preview.")
+                            && !name.starts_with("github-preview.")
                     })
             })
         }) {
@@ -1038,6 +1235,143 @@ mod normalized_origin_tests {
                 .unwrap()
                 .iter()
                 .all(|r| r.method == Method::GET)
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method, path},
+    };
+
+    #[tokio::test]
+    async fn backfill_preserves_notes_flags_and_tags_and_a_second_pass_does_not_rewrite() {
+        let server = MockServer::start().await;
+        let state = tempfile::tempdir().unwrap();
+        let old = json!({"id":"saved","title":"Old","createdAt":"2026-11-16T00:00:00Z",
+            "note":"My personal notes\nKeep all of this.","archived":true,"favourited":true,
+            "tags":[{"id":"mine","name":"Personal","attachedBy":"human"}],
+            "content":{"url":"https://github.com/owner/repo","author":null}});
+        let mut updated = old.clone();
+        updated["createdAt"] = "2020-01-02T03:04:05.000Z".into();
+        updated["title"] = "owner/repo".into();
+        updated["content"]["author"] = "owner".into();
+        updated["tags"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"rust","name":"Rust","attachedBy":"human"}));
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"bookmarks":[old],"nextCursor":null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/lists/list/bookmarks/saved"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/bookmarks/saved"))
+            .and(body_json(
+                json!({"title":"owner/repo","author":"owner","createdAt":"2020-01-02T03:04:05Z"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(updated.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/bookmarks/saved/tags"))
+            .and(body_json(json!({"tags":[{"tagName":"Rust"}]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/saved"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(updated))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            KarakeepClient::new(&server.uri(), "fake").with_state(state.path().to_str().unwrap());
+        let bookmark = BookmarkCreate {
+            url: "https://github.com/owner/repo".into(),
+            metadata: json!({"title":"owner/repo","author":"owner","createdAt":"2020-01-02T03:04:05Z"}),
+            tags: vec!["Rust".into(), "Personal".into()],
+            ..Default::default()
+        };
+        client.upsert(&bookmark, "list").await.unwrap();
+        client.upsert(&bookmark, "list").await.unwrap();
+        let backup = read_state(&client.state_path("metadata-before/saved.json")).unwrap();
+        assert_eq!(backup, old);
+        for request in server.received_requests().await.unwrap() {
+            if request.method == Method::PATCH {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                for field in ["note", "archived", "favourited", "url", "summary"] {
+                    assert!(body.get(field).is_none());
+                }
+            }
+            assert_ne!(request.method, Method::DELETE);
+        }
+        server.verify().await;
+    }
+    #[test]
+    fn metadata_rejects_notes_and_does_not_clear_missing_fields() {
+        assert!(metadata_patch(&json!({}), &json!({"note":"anything"})).is_err());
+        assert_eq!(
+            metadata_patch(
+                &json!({"content":{"author":"existing"}}),
+                &json!({"author":null,"description":""})
+            )
+            .unwrap(),
+            json!({})
+        );
+    }
+    #[tokio::test]
+    async fn renamed_github_repositories_reuse_the_existing_id_including_in_child_lists() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/v1/bookmarks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"bookmarks":[{
+                "id":"original","content":{"url":"https://github.com/old/repo"}}],"nextCursor":null}))).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/lists/child/bookmarks/original"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = KarakeepClient::new(&server.uri(), "fake");
+        client.refresh_bookmarks().await.unwrap();
+        client
+            .alias_bookmark("https://github.com/old/repo", "https://github.com/new/repo")
+            .await;
+        let bookmark = BookmarkCreate {
+            url: "https://github.com/new/repo".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            client.upsert(&bookmark, "child").await.unwrap().0,
+            "original"
+        );
+        assert!(
+            !client
+                .upsert_bookmark_to_list(&bookmark, "child")
+                .await
+                .unwrap()
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method != Method::POST)
         );
     }
 }

@@ -29,6 +29,7 @@ tokio-cron-scheduler = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 wiremock = { workspace = true }
@@ -38,7 +39,7 @@ wiremock = { workspace = true }
 anyhow = "1.0.100"
 dotenvy = "0.15.7"
 futures = "0.3.31"
-reqwest = { version = "0.12.23", features = ["cookies", "json"] }
+reqwest = { version = "0.12.23", features = ["cookies", "json", "multipart"] }
 tokio = { version = "1.47.1", features = ["full"] }
 hnscraper = { path = "../hnscraper" }
 config = "0.15.17"

@@ -78,6 +78,7 @@ impl super::Plugin for GithubStars {
                     title: item["full_name"].as_str().unwrap_or("").to_string(),
                     // GitHub does not provide timestamp for when the repo was starred
                     created_at: None,
+                    ..Default::default()
                 })
                 .collect();
 

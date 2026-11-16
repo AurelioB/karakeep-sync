@@ -55,6 +55,7 @@ impl super::Plugin for PinboardBookmarks {
                 url: post.href,
                 title: post.description,
                 created_at: Some(post.time),
+                ..Default::default()
             })
             .collect();
 

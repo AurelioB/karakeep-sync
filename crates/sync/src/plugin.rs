@@ -122,6 +122,7 @@ mod tests {
                     title: "owner/repo".into(),
                     url: "https://github.com/owner/repo".into(),
                     created_at: None,
+                    ..Default::default()
                 })
                 .collect();
             Ok(Box::pin(futures::stream::iter([bookmarks])))

@@ -1,2 +1,5 @@
 /target
 .env
+/data/
+.env.*
+!.env.example

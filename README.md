@@ -151,3 +151,34 @@ See this PR for adding GitHub stars support as an example: [#2](https://github.c
 ## License
 
 MIT License. See `LICENSE` file for details.
+
+## Fork additions
+
+This fork incorporates [GitHub list support from upstream PR #10](https://github.com/sidoshi/karakeep-sync/pull/10), preserving its original commits and authorship. Enable `KS_GITHUB_SYNCLISTS=true` to import your GitHub lists beneath **GitHub Starred**. Lists track their stable GitHub IDs, so renames update the existing child. Imports are additive: bookmarks and existing memberships are not deleted.
+
+### Reddit preview images
+
+Set `KS_REDDIT_PREVIEWS=true` to use the preview images Reddit returns with your saved items. The sync chooses a useful still image, including gallery images and video posters, and uploads it to Karakeep as the bookmark's banner. It prefers an image up to 1600 pixels wide and rejects files over 20 MiB. Image downloads are restricted to HTTPS Reddit image hosts and use a separate client that never sends your Karakeep API key.
+
+This mode scans all pages Reddit currently exposes, including already imported saves, so existing bookmarks receive previews too. Text-only items, deleted images, and comments without preview metadata retain their current images. The sync does not invent a preview when Reddit supplies none. Original image files and bookmark metadata are backed up before replacement. Owner-uploaded custom cover images are retained.
+
+Mount a persistent writable directory at `/data`, or choose another path with `KS_STATE_PATH`. It holds the preview cache, pending-upload recovery state, original-image backups, and scheduler heartbeat. Keep this directory private and include it in backups. The preview cache prevents repeated downloads/uploads on later runs. A failed image is logged and retried later without stopping bookmark imports. Uploads are paced for Karakeep's API limits, so a large first backfill can take several minutes.
+
+Existing bookmark IDs, titles, notes, tags, list memberships, and saved dates are preserved. For new Reddit saves only, synthetic timestamps spaced one second apart retain Reddit's newest-first order. Reddit does not provide historical save timestamps.
+
+Configured schedules now override the `@daily` defaults correctly. For example, `KS_REDDIT_SCHEDULE=@hourly` and `KS_GITHUB_SCHEDULE=@hourly` run each hour. The Docker image runs as non-root and includes a scheduler heartbeat health check. Set the bind mount's ownership to the image's UID (65532), or override the container user/group for your environment.
+
+For an explicit one-time pass, use `karakeep-sync --once reddit`, `--once github`, or `--once all` with the same environment and persistent state as the service. This does not start the recurring scheduler.
+
+```yaml
+# Add these to your existing karakeep-sync service. Keep credentials in a private
+# environment file or secret manager; do not commit real keys or refresh tokens.
+environment:
+  KS_REDDIT_PREVIEWS: "true"
+  KS_GITHUB_SYNCLISTS: "true"
+  KS_REDDIT_SCHEDULE: "@hourly"
+  KS_GITHUB_SCHEDULE: "@hourly"
+  KS_STATE_PATH: /data
+volumes:
+  - ./sync-data:/data
+```

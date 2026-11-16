@@ -11,6 +11,29 @@ mod settings;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let state_path =
+        std::path::PathBuf::from(std::env::var("KS_STATE_PATH").unwrap_or_else(|_| "/data".into()));
+    let heartbeat = state_path.join("heartbeat.json");
+    if std::env::args().any(|arg| arg == "--healthcheck") {
+        let age = std::fs::metadata(heartbeat)?.modified()?.elapsed()?;
+        anyhow::ensure!(
+            age < std::time::Duration::from_secs(180),
+            "The sync scheduler heartbeat is stale"
+        );
+        return Ok(());
+    }
+    karakeep_client::write_private_json(&heartbeat, &serde_json::json!({"running":true}))?;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Err(error) = karakeep_client::write_private_json(
+                &heartbeat,
+                &serde_json::json!({"running":true}),
+            ) {
+                tracing::error!("Could not write scheduler heartbeat: {error}");
+            }
+        }
+    });
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(
             EnvFilter::from_default_env()
@@ -24,6 +47,23 @@ async fn main() -> anyhow::Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
+    let args: Vec<_> = std::env::args().collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--once") {
+        let selected = args.get(index + 1).map(String::as_str).unwrap_or("all");
+        anyhow::ensure!(
+            ["all", "reddit", "github"].contains(&selected),
+            "Use --once all, reddit or github"
+        );
+        for plugin in plugin::get_plugins() {
+            let wanted = selected == "all"
+                || (selected == "reddit" && plugin.list_name() == "Reddit Saved")
+                || (selected == "github" && plugin.list_name() == "GitHub Starred");
+            if wanted && plugin.is_activated() {
+                plugin.sync().await?;
+            }
+        }
+        return Ok(());
+    }
     let mut scheduler = JobScheduler::new().await?;
 
     let plugins = plugin::get_plugins()

@@ -26,6 +26,8 @@ pub(crate) struct KarakeepSettings {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RedditSettings {
+    #[serde(default)]
+    pub previews: bool,
     pub clientid: Option<String>,
     pub clientsecret: Option<String>,
     pub refreshtoken: Option<String>,
@@ -41,11 +43,17 @@ pub(crate) struct PinboardSettings {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Settings {
+    pub state: StateSettings,
     pub hn: HNSettings,
     pub karakeep: KarakeepSettings,
     pub reddit: RedditSettings,
     pub github: GitHubSettings,
     pub pinboard: PinboardSettings,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StateSettings {
+    pub path: String,
 }
 
 impl Settings {
@@ -54,13 +62,15 @@ impl Settings {
 
         let config = Config::builder()
             .add_source(config::Environment::with_prefix("KS").separator("_"))
-            .set_override("hn.schedule", "@daily")
+            .set_default("hn.schedule", "@daily")
             .unwrap()
-            .set_override("reddit.schedule", "@daily")
+            .set_default("reddit.schedule", "@daily")
             .unwrap()
-            .set_override("github.schedule", "@daily")
+            .set_default("github.schedule", "@daily")
             .unwrap()
-            .set_override("pinboard.schedule", "@daily")
+            .set_default("pinboard.schedule", "@daily")
+            .unwrap()
+            .set_default("state.path", "/data")
             .unwrap()
             .build()
             .unwrap();

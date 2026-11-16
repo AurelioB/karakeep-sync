@@ -39,6 +39,7 @@ impl super::Plugin for HNUpvoted {
                     url: post.url,
                     // HN does not provide timestamp for when the post was upvoted
                     created_at: None,
+                    ..Default::default()
                 })
                 .collect::<Vec<_>>()
         });

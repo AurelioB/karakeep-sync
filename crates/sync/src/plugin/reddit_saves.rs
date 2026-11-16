@@ -19,36 +19,7 @@ impl super::Plugin for RedditSaves {
     async fn to_bookmark_stream(
         &self,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Vec<BookmarkCreate>> + Send>>> {
-        let settings = settings::get_settings();
-        let client_id = settings
-            .reddit
-            .clientid
-            .as_ref()
-            .context("Reddit client ID is not set")?
-            .clone();
-        let client_secret = settings
-            .reddit
-            .clientsecret
-            .as_ref()
-            .context("Reddit client secret is not set")?
-            .clone();
-        let refresh_token = settings
-            .reddit
-            .refreshtoken
-            .as_ref()
-            .context("Reddit refresh token is not set")?
-            .clone();
-        let username = settings
-            .reddit
-            .username
-            .as_ref()
-            .context("Reddit username is not set")?
-            .clone();
-
-        let client = RedditClientRefresher::new(client_id, client_secret, refresh_token)
-            .refresh(username)
-            .await?;
-        let client = Arc::new(client);
+        let client = Arc::new(authenticated().await?);
 
         enum StreamState {
             Init,
@@ -83,6 +54,7 @@ impl super::Plugin for RedditSaves {
                         url: post.url,
                         // Reddt does not provide timestamp for when the post was saved
                         created_at: None,
+                        ..Default::default()
                     })
                     .collect::<Vec<_>>();
 
@@ -91,6 +63,54 @@ impl super::Plugin for RedditSaves {
         });
 
         Ok(Box::pin(stream))
+    }
+
+    async fn sync(&self) -> anyhow::Result<i32> {
+        if !settings::get_settings().reddit.previews {
+            return super::sync_with_client(self, crate::karakeep::get_client()).await;
+        }
+        let reddit = authenticated().await?;
+        let karakeep = crate::karakeep::get_client();
+        karakeep.refresh_bookmarks().await?;
+        let list = karakeep.ensure_list_exists(self.list_name()).await?;
+        let anchor = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let mut after = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut rank = 0_i64;
+        let mut created = 0;
+        let mut previews = 0;
+        loop {
+            let page = reddit.list_saved(after.as_deref()).await?;
+            for post in page.posts {
+                if post.preview_image.is_some() {
+                    previews += 1;
+                }
+                let bookmark = BookmarkCreate {
+                    title: post.title,
+                    url: post.url,
+                    preview_image: post.preview_image,
+                    // Reddit has no save timestamp. Preserve listing order for new saves;
+                    // existing bookmarks, including repaired dates, are never re-dated.
+                    created_at: Some((anchor - chrono::Duration::seconds(rank)).to_rfc3339()),
+                };
+                let (_, is_new) = karakeep.upsert(&bookmark, &list).await?;
+                created += i32::from(is_new);
+                rank += 1;
+            }
+            after = page.after;
+            let Some(ref cursor) = after else { break };
+            anyhow::ensure!(
+                seen.insert(cursor.clone()),
+                "Reddit repeated a saved-items cursor"
+            );
+        }
+        tracing::info!(
+            "Reddit sync complete (saved={}, created={}, previews_available={})",
+            rank,
+            created,
+            previews
+        );
+        Ok(created)
     }
 
     fn is_activated(&self) -> bool {
@@ -106,4 +126,29 @@ impl super::Plugin for RedditSaves {
         let settings = settings::get_settings();
         settings.reddit.schedule.clone()
     }
+}
+
+async fn authenticated() -> anyhow::Result<reddit_client::RedditClient> {
+    let settings = &settings::get_settings().reddit;
+    RedditClientRefresher::new(
+        settings
+            .clientid
+            .clone()
+            .context("Reddit client ID is not set")?,
+        settings
+            .clientsecret
+            .clone()
+            .context("Reddit client secret is not set")?,
+        settings
+            .refreshtoken
+            .clone()
+            .context("Reddit refresh token is not set")?,
+    )
+    .refresh(
+        settings
+            .username
+            .clone()
+            .context("Reddit username is not set")?,
+    )
+    .await
 }

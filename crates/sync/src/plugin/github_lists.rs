@@ -177,6 +177,7 @@ impl GithubLists {
                             title,
                             url,
                             created_at: None,
+                            ..Default::default()
                         };
                         karakeep
                             .upsert_bookmark_to_list(&bookmark, &list_id)

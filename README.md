@@ -108,9 +108,14 @@ Create a `docker-compose.yml` file with the following content:
 ```yaml
 services:
   karakeep-sync:
-    image: ghcr.io/sidoshi/karakeep-sync:latest
+    image: karakeep-sync:local
+    build:
+      context: https://github.com/AurelioB/karakeep-sync.git#main
+    pull_policy: build
     container_name: karakeep-sync
     restart: unless-stopped
+    volumes:
+      - ./sync-data:/data
     environment:
       - KS_KARAKEEP_AUTH=<your_karakeep_auth_cookie> # required
       - KS_KARAKEEP_URL=<your_karakeep_instance_url> # required

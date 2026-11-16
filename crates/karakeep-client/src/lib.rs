@@ -524,6 +524,42 @@ impl KarakeepClient {
         }
         Ok(bytes)
     }
+    async fn backup_original_asset(&self, asset: &str, path: &Path) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut response = self
+            .client
+            .get(format!("{}/api/v1/assets/{asset}", self.url))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Original-image backup returned {}",
+            response.status()
+        );
+        // Old covers may be large animated GIFs. Stream them to private storage;
+        // the 20 MiB limit applies to new preview payloads, not original backups.
+        const MAX: u64 = 128 * 1024 * 1024;
+        anyhow::ensure!(
+            response.content_length().is_none_or(|n| n <= MAX),
+            "Original-image backup exceeds 128 MiB"
+        );
+        let temporary = path.with_extension("partial");
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary).await?;
+        let mut total = 0_u64;
+        while let Some(chunk) = response.chunk().await? {
+            total += chunk.len() as u64;
+            anyhow::ensure!(total <= MAX, "Original-image backup exceeds 128 MiB");
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        tokio::fs::rename(temporary, path).await?;
+        Ok(())
+    }
     pub async fn sync_preview(&self, row: &Value, image: &str) -> anyhow::Result<bool> {
         let Some(url) = reddit_image_url(image) else {
             anyhow::bail!("Invalid Reddit preview URL")
@@ -575,21 +611,9 @@ impl KarakeepClient {
         let backup = self.state_path("original-previews").join(&bookmark_id);
         if !backup.with_extension("json").exists() {
             if let Some(asset) = current {
-                let original = Self::bounded_bytes(
-                    self.client
-                        .get(format!("{}/api/v1/assets/{asset}", self.url))
-                        .send()
-                        .await?,
-                )
-                .await?;
                 std::fs::create_dir_all(&backup)?;
-                let asset_file = backup.join("image");
-                std::fs::write(&asset_file, original)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(asset_file, std::fs::Permissions::from_mode(0o600))?;
-                }
+                self.backup_original_asset(asset, &backup.join("image"))
+                    .await?;
             }
             write_private_json(&backup.with_extension("json"), row)?;
         }
@@ -931,5 +955,44 @@ mod exact_lookup_tests {
                 .is_err()
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod large_original_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    #[tokio::test]
+    async fn large_original_cover_is_backed_up_without_relaxing_the_new_preview_limit() {
+        let server = MockServer::start().await;
+        let bytes = vec![42_u8; 21 * 1024 * 1024];
+        Mock::given(method("GET"))
+            .and(path("/api/v1/assets/oldgif"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("original.gif");
+        let client = KarakeepClient::new(&server.uri(), "test-token");
+        client.backup_original_asset("oldgif", &file).await.unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let response = client
+            .client
+            .get(format!("{}/api/v1/assets/oldgif", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert!(KarakeepClient::bounded_bytes(response).await.is_err());
     }
 }

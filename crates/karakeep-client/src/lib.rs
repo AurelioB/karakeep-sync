@@ -259,6 +259,23 @@ impl KarakeepClient {
         &self,
         bookmark_url: &str,
     ) -> anyhow::Result<Option<String>> {
+        // Full-text search with limit=1 can return another repository ahead of the
+        // exact URL. Recreating an existing URL re-saves it and changes its date.
+        let exact = self
+            .client
+            .get(format!("{}/api/v1/bookmarks/check-url", self.url))
+            .query(&[("url", bookmark_url)])
+            .send()
+            .await?;
+        if exact.status() != reqwest::StatusCode::NOT_FOUND {
+            let exact = parse_response(exact).await?;
+            return match exact.get("bookmarkId") {
+                Some(Value::Null) => Ok(None),
+                Some(Value::String(id)) => Ok(Some(id.clone())),
+                _ => anyhow::bail!("Invalid exact-URL lookup response"),
+            };
+        }
+        // Compatibility for Karakeep versions that predate exact-URL lookup.
         let url = format!("{}/api/v1/bookmarks/search", self.url);
 
         let resp = parse_response(
@@ -848,5 +865,71 @@ mod preview_tests {
                 .get("authorization")
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod exact_lookup_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path, query_param},
+    };
+    #[tokio::test]
+    async fn exact_github_match_is_not_resaved_or_redated() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/check-url"))
+            .and(query_param("url", "https://github.com/owner/repo"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"bookmarkId":"existing"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/lists/list/bookmarks/existing"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = KarakeepClient::new(&server.uri(), "test-token");
+        let bookmark = BookmarkCreate {
+            title: "owner/repo".into(),
+            url: "https://github.com/owner/repo".into(),
+            created_at: Some("2026-11-16T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(
+            !client
+                .upsert_bookmark_to_list(&bookmark, "list")
+                .await
+                .unwrap()
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method != Method::POST && r.method != Method::PATCH)
+        );
+    }
+    #[tokio::test]
+    async fn a_failed_exact_lookup_cannot_create_a_duplicate_or_reset_a_date() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/check-url"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = KarakeepClient::new(&server.uri(), "test-token");
+        assert!(
+            client
+                .check_exists_bookmark("https://github.com/owner/repo")
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

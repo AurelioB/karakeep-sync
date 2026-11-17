@@ -250,8 +250,12 @@ fn reader_document(
         reqwest::Url::parse(link).is_ok_and(|u| matches!(u.scheme(), "http" | "https" | "mailto"))
             || link.starts_with('#')
     }
-    let title = metadata["title"].as_str()?;
     let body = metadata["description"].as_str().unwrap_or("");
+    // /api/info omits a saved comment's parent title. Its complete body is
+    // still useful reader content; don't discard it for a missing heading.
+    let title = metadata["title"]
+        .as_str()
+        .or_else(|| (!body.is_empty()).then_some("Reddit comment"))?;
     let parser = Parser::new_ext(
         body,
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS,
@@ -513,5 +517,13 @@ mod reader_tests {
         assert!(!html.contains("<script>"));
         assert!(!html.contains("href=\"javascript:"));
         assert!(html.contains("&lt;script&gt;"));
+        let comment = reader_document(
+            &json!({"description":"A complete saved comment."}),
+            "https://reddit.com/comments/abc/title/def",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(comment.contains("A complete saved comment."));
     }
 }

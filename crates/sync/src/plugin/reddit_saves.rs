@@ -177,6 +177,7 @@ impl super::Plugin for RedditSaves {
                 repaired += usize::from(karakeep.repair_reddit_capture(&row, &metadata).await?);
             }
         }
+        repaired += karakeep.remove_retained_error_screenshots().await?;
         tracing::info!(
             "Reddit legacy capture cleanup complete (additional_repairs={})",
             repaired

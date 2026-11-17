@@ -890,6 +890,66 @@ impl KarakeepClient {
         tracing::info!(bookmark=%bookmark_id,"Reddit full reader content queued");
         Ok(true)
     }
+    pub async fn remove_retained_error_screenshots(&self) -> anyhow::Result<usize> {
+        let mut removed = 0;
+        for row in self.list_bookmarks(None).await? {
+            if row["content"]["crawlStatus"] == "pending" || blocked_reddit_capture(&row) {
+                continue;
+            }
+            let Some(asset) = row["content"]["screenshotAssetId"].as_str() else {
+                continue;
+            };
+            let bookmark_id = id(&row)?;
+            let mut confirmed = None;
+            for directory in [
+                "metadata-before",
+                "reddit-reader-before",
+                "original-previews",
+            ] {
+                let old = read_state(
+                    &self
+                        .state_path(directory)
+                        .join(format!("{bookmark_id}.json")),
+                )?;
+                if blocked_reddit_capture(&old) && old["content"]["screenshotAssetId"] == asset {
+                    confirmed = Some(old);
+                    break;
+                }
+            }
+            let Some(original) = confirmed else {
+                continue;
+            };
+            if row["assets"].as_array().is_some_and(|assets| {
+                assets.iter().any(|a| {
+                    a["id"] == asset && a["fileName"].as_str().is_some_and(|name| !name.is_empty())
+                })
+            }) {
+                continue;
+            }
+            let backup = self.state_path("reddit-capture-before").join(&bookmark_id);
+            if !backup.with_extension("json").exists() {
+                write_private_json(&backup.with_extension("json"), &original)?;
+            }
+            std::fs::create_dir_all(&backup)?;
+            let screenshot = backup.join(format!("screenshot-{asset}"));
+            if !screenshot.exists() {
+                self.backup_original_asset(asset, &screenshot).await?;
+            }
+            self.request(
+                Method::DELETE,
+                &format!("/bookmarks/{bookmark_id}/assets/{asset}"),
+                None,
+            )
+            .await?;
+            let fresh = self
+                .request(Method::GET, &format!("/bookmarks/{bookmark_id}"), None)
+                .await?;
+            self.cache_row(&fresh).await;
+            removed += 1;
+            tracing::info!(bookmark=%bookmark_id,"Removed retained Reddit error screenshot");
+        }
+        Ok(removed)
+    }
     pub async fn retry_readers(&self) -> anyhow::Result<()> {
         let directory = self.state_path("reddit-reader-documents");
         if !directory.exists() {
@@ -2043,5 +2103,69 @@ mod removed_content_tests {
         write_private_json(&client.state_path("reddit-reader-documents/saved.json"),&json!({"html":"<meta name=\"description\" content=\"Original complete body\"><article>Original complete body</article>"})).unwrap();
         assert!(!client.sync_reader(&json!({"id":"saved","content":{"title":"Original post","crawlStatus":"success"}}),"<article>Text no longer available</article>").await.unwrap());
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod retained_screenshot_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    #[tokio::test]
+    async fn a_successful_recrawl_cannot_leave_its_original_error_screenshot_attached() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            KarakeepClient::new(&server.uri(), "fake").with_state(dir.path().to_str().unwrap());
+        let old = json!({"id":"saved","note":"Keep my notes","createdAt":"2020-01-01T00:00:00Z",
+            "content":{"url":"https://reddit.com/comments/abc/title/","title":"Too Many Requests","screenshotAssetId":"error"}});
+        let mut current = old.clone();
+        current["content"]["title"] = "Actual post title".into();
+        current["content"]["crawlStatus"] = "success".into();
+        let mut fixed = current.clone();
+        fixed["content"]["screenshotAssetId"] = Value::Null;
+        write_private_json(&client.state_path("metadata-before/saved.json"), &old).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"bookmarks":[current],"nextCursor":null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/assets/error"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bad screenshot".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/bookmarks/saved/assets/error"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/saved"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixed))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(client.remove_retained_error_screenshots().await.unwrap(), 1);
+        assert_eq!(
+            std::fs::read(client.state_path("reddit-capture-before/saved/screenshot-error"))
+                .unwrap(),
+            b"bad screenshot"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method != Method::PATCH)
+        );
     }
 }

@@ -271,3 +271,7 @@ the API before retrying, including old items no longer in the saved listing.
 If Reddit returns a removed comment with no recoverable text or parent title, reader
 recovery shows an explicit availability notice instead of the old verification page.
 A previously archived full body is kept if a later API response loses that text.
+
+Completed recrawls are also checked against the private pre-change snapshots. If
+a successful reader rebuild retained the exact original error screenshot, the
+screenshot is backed up and detached without changing metadata, notes or dates.

@@ -225,7 +225,7 @@ To backfill Reddit bookmarks older than the saved-list API returns, run:
 karakeep-sync --once reddit --backfill
 ```
 
-This resolves the post/comment IDs from the existing Reddit Saved list through
+This resolves the post/comment IDs from existing Reddit bookmarks through
 Reddit's `/api/info`, in batches of up to 100. It requires `read` scope in addition
 to `history` (reconnect once if necessary). It never infers a saved date from a
 post's publication date. Items Reddit cannot return retain their current metadata.
@@ -262,3 +262,8 @@ separate bookmark IDs, notes, saved dates, and memberships remain separate.
 `KS_UPLOAD_INTERVAL_MS` controls spacing between asset uploads (default 2200 ms,
 about 27/minute). Set a shorter interval only when the target instance's upload
 limits permit it. HTTP rate-limit responses are deferred and retried safely.
+
+Explicit Reddit backfill also covers manually saved Reddit links outside the sync
+list. It enriches existing records only, preserving every list membership and never
+adding a manual bookmark to Reddit Saved. Failed reader builds are rechecked from
+the API before retrying, including old items no longer in the saved listing.

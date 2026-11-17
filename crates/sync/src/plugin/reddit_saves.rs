@@ -115,7 +115,7 @@ impl super::Plugin for RedditSaves {
             );
         }
         if std::env::args().any(|a| a == "--backfill") {
-            let older = karakeep.list_bookmarks(Some(&list)).await?;
+            let older = karakeep.list_bookmarks(None).await?;
             let mut ids = std::collections::BTreeSet::new();
             for row in older {
                 let Some(url) = row["content"]["url"].as_str() else {
@@ -148,7 +148,9 @@ impl super::Plugin for RedditSaves {
                         // Backfilling an older item must never invent a new saved date.
                         created_at: None,
                     };
-                    karakeep.upsert(&bookmark, &list).await?;
+                    // Existing manual bookmarks need recovery too, without changing
+                    // their list memberships or creating posts absent from Karakeep.
+                    karakeep.enrich_existing(&bookmark).await?;
                     found += 1;
                 }
             }

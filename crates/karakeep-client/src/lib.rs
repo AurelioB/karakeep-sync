@@ -713,6 +713,37 @@ impl KarakeepClient {
         }
         Ok((bookmark_id, created))
     }
+    pub async fn enrich_existing(&self, bookmark: &BookmarkCreate) -> anyhow::Result<usize> {
+        if self.index.lock().await.is_none() {
+            self.refresh_bookmarks().await?;
+        }
+        let key = bookmark_key(&bookmark.url);
+        let mut rows = self
+            .index
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.duplicates
+                .lock()
+                .await
+                .get(&key)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let count = rows.len();
+        for row in rows {
+            let row = self
+                .sync_metadata(&row, &bookmark.metadata, &bookmark.tags)
+                .await?;
+            self.enrich_content(&row, bookmark).await?;
+        }
+        Ok(count)
+    }
     async fn enrich_content(&self, row: &Value, bookmark: &BookmarkCreate) -> anyhow::Result<()> {
         if let Some(image) = &bookmark.preview_image {
             if let Err(error) = self.sync_preview(row, image).await {
@@ -850,13 +881,20 @@ impl KarakeepClient {
             return Ok(());
         }
         let cache = read_state(&self.state_path("reddit-reader.json"))?;
+        let failed: std::collections::HashSet<String> = self
+            .list_bookmarks(None)
+            .await?
+            .into_iter()
+            .filter(|row| row["content"]["crawlStatus"] == "failure")
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect();
         for file in std::fs::read_dir(directory)? {
             let file = file?;
             let path = file.path();
             let Some(bookmark_id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if cache[bookmark_id]["queued"] == true {
+            if cache[bookmark_id]["queued"] == true && !failed.contains(bookmark_id) {
                 continue;
             }
             let document = read_state(&path)?;
@@ -1873,6 +1911,19 @@ mod duplicate_tests {
             ..Default::default()
         };
         assert!(!client.upsert(&item, "reddit").await.unwrap().1);
+        let count = server.received_requests().await.unwrap().len();
+        assert_eq!(client.enrich_existing(&item).await.unwrap(), 2);
+        assert_eq!(
+            client
+                .enrich_existing(&BookmarkCreate {
+                    url: "https://reddit.com/comments/missing/title/".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), count);
         for row in rows {
             assert_eq!(
                 read_state(&client.state_path(&format!(

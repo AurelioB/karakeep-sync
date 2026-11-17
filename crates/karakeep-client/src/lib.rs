@@ -1224,13 +1224,9 @@ impl KarakeepClient {
         Ok(())
     }
     async fn cache_preview(&self, row: &Value, asset: &str) {
-        if let Some(cache) = self.index.lock().await.as_mut() {
-            if let Some(row) =
-                cache.get_mut(&bookmark_key(row["content"]["url"].as_str().unwrap_or("")))
-            {
-                row["content"]["imageAssetId"] = asset.into();
-            }
-        }
+        let mut updated = row.clone();
+        updated["content"]["imageAssetId"] = asset.into();
+        self.cache_row(&updated).await;
     }
 }
 

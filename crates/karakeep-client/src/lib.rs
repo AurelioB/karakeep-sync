@@ -777,6 +777,21 @@ impl KarakeepClient {
         let path = self.state_path("reddit-reader.json");
         let mut cache = read_state(&path)?;
         let recorded = &cache[&bookmark_id];
+        // Reddit can remove a post after it was archived. Keep our complete
+        // saved body instead of replacing it with an empty/deleted response.
+        if recorded.is_object() && !html.contains("<meta name=\"description\"") {
+            let old = read_state(
+                &self
+                    .state_path("reddit-reader-documents")
+                    .join(format!("{bookmark_id}.json")),
+            )?;
+            if old["html"]
+                .as_str()
+                .is_some_and(|s| s.contains("<meta name=\"description\""))
+            {
+                return Ok(false);
+            }
+        }
         let needs_reader = blocked_reddit_capture(row)
             || recorded.is_object()
             || row["content"]["crawlStatus"] == "failure";
@@ -2008,5 +2023,25 @@ mod reader_tests {
             }
             server.verify().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod removed_content_tests {
+    use super::*;
+    #[tokio::test]
+    async fn an_empty_reddit_response_does_not_replace_previously_archived_full_text() {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let client =
+            KarakeepClient::new(&server.uri(), "fake").with_state(dir.path().to_str().unwrap());
+        write_private_json(
+            &client.state_path("reddit-reader.json"),
+            &json!({"saved":{"hash":"old","asset_id":"real","queued":true}}),
+        )
+        .unwrap();
+        write_private_json(&client.state_path("reddit-reader-documents/saved.json"),&json!({"html":"<meta name=\"description\" content=\"Original complete body\"><article>Original complete body</article>"})).unwrap();
+        assert!(!client.sync_reader(&json!({"id":"saved","content":{"title":"Original post","crawlStatus":"success"}}),"<article>Text no longer available</article>").await.unwrap());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

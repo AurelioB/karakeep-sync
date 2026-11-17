@@ -267,3 +267,7 @@ Explicit Reddit backfill also covers manually saved Reddit links outside the syn
 list. It enriches existing records only, preserving every list membership and never
 adding a manual bookmark to Reddit Saved. Failed reader builds are rechecked from
 the API before retrying, including old items no longer in the saved listing.
+
+If Reddit returns a removed comment with no recoverable text or parent title, reader
+recovery shows an explicit availability notice instead of the old verification page.
+A previously archived full body is kept if a later API response loses that text.

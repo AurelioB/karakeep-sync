@@ -253,9 +253,8 @@ fn reader_document(
     let body = metadata["description"].as_str().unwrap_or("");
     // /api/info omits a saved comment's parent title. Its complete body is
     // still useful reader content; don't discard it for a missing heading.
-    let title = metadata["title"]
-        .as_str()
-        .or_else(|| (!body.is_empty()).then_some("Reddit comment"))?;
+    let unavailable = metadata["title"].as_str().is_none() && body.is_empty();
+    let title = metadata["title"].as_str().unwrap_or("Reddit comment");
     let parser = Parser::new_ext(
         body,
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS,
@@ -297,6 +296,9 @@ fn reader_document(
     });
     let mut content = String::new();
     pulldown_cmark::html::push_html(&mut content, parser);
+    if unavailable {
+        content.push_str("<p>Reddit no longer provides the text of this saved item. Your saved link and notes are preserved.</p>");
+    }
     if let Some(link) = outbound.filter(|s| safe_link(s)) {
         content.push_str(&format!(
             "<p><a href=\"{}\">{}</a></p>",
@@ -525,5 +527,13 @@ mod reader_tests {
         )
         .unwrap();
         assert!(comment.contains("A complete saved comment."));
+        let removed = reader_document(
+            &json!({}),
+            "https://reddit.com/comments/abc/title/def",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(removed.contains("Reddit no longer provides the text"));
     }
 }

@@ -127,20 +127,32 @@ pub fn blocked_reddit_capture(row: &Value) -> bool {
     if host != "redd.it" && host != "reddit.com" && !host.ends_with(".reddit.com") {
         return false;
     }
-    let title = row["content"]["title"]
+    let raw = row["content"]["title"]
         .as_str()
         .unwrap_or("")
         .to_lowercase();
-    [
-        "prove your humanity",
-        "too many requests",
-        "blocked by network security",
-        "whoa there, pardner",
-        "access denied",
-        "just a moment",
-    ]
-    .iter()
-    .any(|marker| title.contains(marker))
+    let normalized = raw
+        .replace(|c| c == '–' || c == '—', "-")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = normalized
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '…'));
+    let title = title
+        .strip_prefix("reddit - ")
+        .or_else(|| title.strip_prefix("reddit.com - "))
+        .unwrap_or(title);
+    matches!(
+        title,
+        "prove your humanity"
+            | "too many requests"
+            | "429 too many requests"
+            | "blocked by network security"
+            | "whoa there, pardner"
+            | "access denied"
+            | "just a moment"
+    )
 }
 
 fn blocked_summary(summary: &str) -> bool {
@@ -1909,6 +1921,11 @@ mod capture_tests {
     fn successful_captures_are_untouched_and_rate_limit_pages_are_recognized() {
         let row = json!({"content":{"url":"https://reddit.com/r/test/comments/abc/title/","title":"A useful post : r/test"}});
         assert!(!blocked_reddit_capture(&row));
+        let mut topic = row.clone();
+        topic["content"]["title"] = "Too many requests on my API : r/rust".into();
+        assert!(!blocked_reddit_capture(&topic));
+        topic["content"]["title"] = "Prove your humanity: a guide : r/privacy".into();
+        assert!(!blocked_reddit_capture(&topic));
         let mut row = row;
         row["content"]["title"] = "Too Many Requests".into();
         assert!(blocked_reddit_capture(&row));

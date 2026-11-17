@@ -132,13 +132,11 @@ pub fn blocked_reddit_capture(row: &Value) -> bool {
         .unwrap_or("")
         .to_lowercase();
     let normalized = raw
-        .replace(|c| c == '–' || c == '—', "-")
+        .replace(['–', '—'], "-")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let title = normalized
-        .trim()
-        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '…'));
+    let title = normalized.trim().trim_end_matches(['.', '!', '…']);
     let title = title
         .strip_prefix("reddit - ")
         .or_else(|| title.strip_prefix("reddit.com - "))

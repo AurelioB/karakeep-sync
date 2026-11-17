@@ -199,7 +199,7 @@ Private original metadata is saved under `/data/metadata-before` before the firs
 | Karakeep field | GitHub | Reddit |
 | --- | --- | --- |
 | Title | Repository name with owner | Post title; parent post title for saved comments |
-| Description | Repository description | Post text or comment excerpt, up to 1,000 characters |
+| Description | Repository description | Complete post text or comment body |
 | Author | Repository owner | Post/comment author, when available |
 | Publisher | GitHub | Reddit, including the subreddit |
 | Publication date | Repository creation | Post/comment creation |
@@ -231,3 +231,34 @@ to `history` (reconnect once if necessary). It never infers a saved date from a
 post's publication date. Items Reddit cannot return retain their current metadata.
 Normal scheduled runs refresh the saved listing; the explicit older-item backfill
 can be repeated safely. No metadata is written into notes.
+
+### Repair Reddit verification and rate-limit captures
+
+Reddit sync also recognizes crawled verification-page and HTTP 429 titles. Before
+removing a crawler screenshot it saves the full original bookmark metadata/HTML and
+screenshot privately under `/data/reddit-capture-before`. Uploaded custom screenshots,
+real banners, notes, flags, saved dates, and useful existing summaries are preserved.
+Summaries that describe the error page are replaced with a short extract from the
+actual Reddit post/comment (or its source title for link-only posts); unavailable
+source content results in clearing the bogus summary, not inventing one. The existing
+native description holds the source excerpt as well. After a screenshot is removed,
+Karakeep chooses its normal overview/real banner instead of the captured error page.
+
+The full Reddit Saved list is checked for legacy captures on scheduled passes, so
+older items can be cleaned even outside the current saved API listing. Cleanup is
+idempotent and will repair a later recrawl that captures another error page. The original captured HTML is saved privately before repair. Blocked or failed
+reader content is replaced through Karakeep’s native precrawled-archive attachment
+and reader rebuild APIs, without re-saving bookmarks or direct database writes.
+
+Full Reddit bodies are retained in descriptions and rendered as safe Markdown HTML
+for reader recovery, including paragraphs, links, tables and code blocks. Raw active
+HTML is escaped and unsafe link schemes are removed. Reader archives are private,
+tracked by content hash, retried when attachment/queueing fails, and rebuilt only
+when source content changes. A rebuild already pending is reused. Healthy captured
+reader content and custom archives are not replaced merely to add metadata.
+
+All existing copies of equivalent Reddit URLs receive metadata and previews;
+separate bookmark IDs, notes, saved dates, and memberships remain separate.
+`KS_UPLOAD_INTERVAL_MS` controls spacing between asset uploads (default 2200 ms,
+about 27/minute). Set a shorter interval only when the target instance's upload
+limits permit it. HTTP rate-limit responses are deferred and retried safely.

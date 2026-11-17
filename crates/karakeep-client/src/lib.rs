@@ -23,6 +23,8 @@ pub struct KarakeepClient {
     images: Client,
     state: PathBuf,
     index: Mutex<Option<HashMap<String, Value>>>,
+    duplicates: Mutex<HashMap<String, Vec<Value>>>,
+    upload_interval: Duration,
     previews: Mutex<Option<Instant>>,
 }
 
@@ -32,6 +34,7 @@ pub struct BookmarkCreate {
     pub url: String,
     pub created_at: Option<String>,
     pub preview_image: Option<String>,
+    pub reader_html: Option<String>,
     /// Only native metadata fields; notes and user flags are never accepted here.
     pub metadata: Value,
     pub tags: Vec<String>,
@@ -111,6 +114,81 @@ pub fn source_image_url(raw: &str) -> Option<Url> {
             ))
         .then_some(url)
     })
+}
+
+pub fn blocked_reddit_capture(row: &Value) -> bool {
+    let Some(url) = row["content"]["url"]
+        .as_str()
+        .and_then(|u| Url::parse(u).ok())
+    else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or("");
+    if host != "redd.it" && host != "reddit.com" && !host.ends_with(".reddit.com") {
+        return false;
+    }
+    let title = row["content"]["title"]
+        .as_str()
+        .unwrap_or("")
+        .to_lowercase();
+    [
+        "prove your humanity",
+        "too many requests",
+        "blocked by network security",
+        "whoa there, pardner",
+        "access denied",
+        "just a moment",
+    ]
+    .iter()
+    .any(|marker| title.contains(marker))
+}
+
+fn blocked_summary(summary: &str) -> bool {
+    let summary = summary.to_lowercase();
+    [
+        "prove your humanity",
+        "too many requests",
+        "rate limit",
+        "rate-limit",
+        "http 429",
+        "http error 429",
+        "429 error",
+        "access denied",
+        "verify you are human",
+        "verify that you are human",
+        "human verification",
+        "captcha",
+        "blocked by network security",
+        "prove they are human",
+        "prove you are human",
+        "security check",
+        "bot-verification",
+        "anti-bot",
+        "humanity",
+        "verify they are human",
+        "excessive requests",
+        "excessive number of requests",
+        "temporarily blocked",
+        "temporary block",
+    ]
+    .iter()
+    .any(|marker| summary.contains(marker))
+}
+
+fn reddit_excerpt(metadata: &Value) -> Option<String> {
+    let text = metadata["description"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| metadata["title"].as_str().filter(|s| !s.trim().is_empty()))?;
+    let first = text.split("\n\n").find(|s| !s.trim().is_empty())?.trim();
+    let mut excerpt: String = first.chars().take(600).collect();
+    if first.chars().count() > 600 {
+        if let Some(space) = excerpt.rfind(char::is_whitespace) {
+            excerpt.truncate(space);
+        }
+        excerpt.push('…');
+    }
+    Some(excerpt)
 }
 
 fn metadata_patch(row: &Value, metadata: &Value) -> anyhow::Result<Value> {
@@ -223,6 +301,13 @@ impl KarakeepClient {
             images,
             state: "/data".into(),
             index: Mutex::new(None),
+            duplicates: Mutex::new(HashMap::new()),
+            upload_interval: Duration::from_millis(
+                std::env::var("KS_UPLOAD_INTERVAL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2200),
+            ),
             previews: Mutex::new(None),
         }
     }
@@ -303,11 +388,21 @@ impl KarakeepClient {
         let mut index = self.index.lock().await;
         let bookmarks = self.list_bookmarks(None).await?;
         let mut map = HashMap::new();
+        let mut duplicates: HashMap<String, Vec<Value>> = HashMap::new();
         for b in bookmarks {
             if let Some(url) = b["content"]["url"].as_str() {
-                map.entry(bookmark_key(url)).or_insert(b);
+                let key = bookmark_key(url);
+                match map.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(b);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        duplicates.entry(key).or_default().push(b);
+                    }
+                }
             }
         }
+        *self.duplicates.lock().await = duplicates;
         *index = Some(map);
         Ok(())
     }
@@ -602,13 +697,251 @@ impl KarakeepClient {
         row = self
             .sync_metadata(&row, &bookmark.metadata, &bookmark.tags)
             .await?;
-        if let Some(image) = &bookmark.preview_image {
-            if let Err(error) = self.sync_preview(&row, image).await {
-                // A failed image must not stop the saved-post import or mutate dates.
-                tracing::warn!(bookmark=%bookmark_id,"Source preview deferred: {error}");
-            }
+        self.enrich_content(&row, bookmark).await?;
+        let duplicates = self
+            .duplicates
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        for duplicate in duplicates {
+            let duplicate = self
+                .sync_metadata(&duplicate, &bookmark.metadata, &bookmark.tags)
+                .await?;
+            self.enrich_content(&duplicate, bookmark).await?;
         }
         Ok((bookmark_id, created))
+    }
+    async fn enrich_content(&self, row: &Value, bookmark: &BookmarkCreate) -> anyhow::Result<()> {
+        if let Some(image) = &bookmark.preview_image {
+            if let Err(error) = self.sync_preview(row, image).await {
+                tracing::warn!(bookmark=%id(row)?, "Source preview deferred: {error}");
+            }
+        }
+        self.repair_reddit_capture(row, &bookmark.metadata).await?;
+        if let Some(html) = &bookmark.reader_html {
+            if let Err(error) = self.sync_reader(row, html).await {
+                tracing::warn!(bookmark=%id(row)?, "Reddit reader deferred: {error}");
+            }
+        }
+        Ok(())
+    }
+    async fn cache_row(&self, row: &Value) {
+        if let Some(cache) = self.index.lock().await.as_mut() {
+            for entry in cache.values_mut().filter(|e| e["id"] == row["id"]) {
+                *entry = row.clone();
+            }
+        }
+        for entries in self.duplicates.lock().await.values_mut() {
+            for entry in entries.iter_mut().filter(|e| e["id"] == row["id"]) {
+                *entry = row.clone();
+            }
+        }
+    }
+    async fn sync_reader(&self, row: &Value, html: &str) -> anyhow::Result<bool> {
+        let already_pending = row["content"]["crawlStatus"] == "pending";
+        use sha2::{Digest, Sha256};
+        let bookmark_id = id(row)?;
+        let path = self.state_path("reddit-reader.json");
+        let mut cache = read_state(&path)?;
+        let recorded = &cache[&bookmark_id];
+        let needs_reader = blocked_reddit_capture(row)
+            || recorded.is_object()
+            || row["content"]["crawlStatus"] == "failure";
+        if !needs_reader {
+            return Ok(false);
+        }
+        let hash = format!("{:x}", Sha256::digest(html.as_bytes()));
+        if recorded["hash"] == hash
+            && recorded["queued"] == true
+            && row["content"]["crawlStatus"] != "failure"
+        {
+            return Ok(false);
+        }
+        let fresh = self
+            .request(
+                Method::GET,
+                &format!("/bookmarks/{bookmark_id}?includeContent=true"),
+                None,
+            )
+            .await?;
+        let backup = self
+            .state_path("reddit-reader-before")
+            .join(format!("{bookmark_id}.json"));
+        if !backup.exists() {
+            write_private_json(&backup, &fresh)?;
+        }
+        let stored = self
+            .state_path("reddit-reader-documents")
+            .join(format!("{bookmark_id}.json"));
+        write_private_json(&stored, &json!({"html":html,"hash":hash}))?;
+        let asset = if recorded["hash"] == hash && recorded["asset_id"].is_string() {
+            recorded["asset_id"].as_str().unwrap().to_owned()
+        } else {
+            let mut last = self.previews.lock().await;
+            if let Some(instant) = *last {
+                tokio::time::sleep(self.upload_interval.saturating_sub(instant.elapsed())).await;
+            }
+            let part = reqwest::multipart::Part::text(html.to_owned())
+                .file_name("reddit-reader.html")
+                .mime_str("text/html")?;
+            let response = self
+                .client
+                .post(format!("{}/api/v1/assets", self.url))
+                .multipart(reqwest::multipart::Form::new().part("file", part))
+                .send()
+                .await?;
+            *last = Some(Instant::now());
+            let response = parse_response(response).await?;
+            response["assetId"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Reader upload has no asset ID"))?
+                .to_owned()
+        };
+        cache[&bookmark_id] = json!({"hash":hash,"asset_id":asset,"queued":false});
+        write_private_json(&path, &cache)?;
+        let attached = fresh["assets"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|a| a["id"] == asset));
+        if !attached {
+            let own_old = fresh["assets"].as_array().into_iter().flatten().find(|a| {
+                a["assetType"] == "precrawledArchive" && a["fileName"] == "reddit-reader.html"
+            });
+            if let Some(old) = own_old {
+                self.request(
+                    Method::PUT,
+                    &format!("/bookmarks/{bookmark_id}/assets/{}", id(old)?),
+                    Some(&json!({"assetId":asset})),
+                )
+                .await?;
+            } else {
+                self.request(
+                    Method::POST,
+                    &format!("/bookmarks/{bookmark_id}/assets"),
+                    Some(&json!({"id":asset,"assetType":"precrawledArchive"})),
+                )
+                .await?;
+            }
+        }
+        // Unlike the SingleFile create endpoint, attachment + recrawl never resaves
+        // the bookmark, changes its date, or clears its archive flag.
+        if !already_pending {
+            let response = self
+                .client
+                .post(format!("{}/api/trpc/bookmarks.recrawlBookmark", self.url))
+                .json(&json!({"json":{"bookmarkId":bookmark_id}}))
+                .send()
+                .await?;
+            let response = parse_response(response).await?;
+            anyhow::ensure!(
+                response.get("error").is_none(),
+                "Reader rebuild was rejected"
+            );
+        }
+        cache[&bookmark_id]["queued"] = true.into();
+        write_private_json(&path, &cache)?;
+        tracing::info!(bookmark=%bookmark_id,"Reddit full reader content queued");
+        Ok(true)
+    }
+    pub async fn retry_readers(&self) -> anyhow::Result<()> {
+        let directory = self.state_path("reddit-reader-documents");
+        if !directory.exists() {
+            return Ok(());
+        }
+        let cache = read_state(&self.state_path("reddit-reader.json"))?;
+        for file in std::fs::read_dir(directory)? {
+            let file = file?;
+            let path = file.path();
+            let Some(bookmark_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if cache[bookmark_id]["queued"] == true {
+                continue;
+            }
+            let document = read_state(&path)?;
+            let Some(html) = document["html"].as_str() else {
+                continue;
+            };
+            let row = self
+                .request(Method::GET, &format!("/bookmarks/{bookmark_id}"), None)
+                .await?;
+            if let Err(error) = self.sync_reader(&row, html).await {
+                tracing::warn!("Reddit reader retry deferred: {error}");
+            }
+        }
+        Ok(())
+    }
+    pub async fn repair_reddit_capture(
+        &self,
+        row: &Value,
+        metadata: &Value,
+    ) -> anyhow::Result<bool> {
+        if !blocked_reddit_capture(row) || row["content"]["crawlStatus"] == "pending" {
+            return Ok(false);
+        }
+        let replacement = reddit_excerpt(metadata)
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        let needs_summary = |row: &Value| {
+            (row["summary"].as_str().is_some_and(blocked_summary) || row["summary"].is_null())
+                && row["summary"] != replacement
+        };
+        if row["content"]["screenshotAssetId"].is_null() && !needs_summary(row) {
+            return Ok(false);
+        }
+        let bookmark_id = id(row)?;
+        // Read current assets before detaching anything; previews can finish while syncing.
+        let fresh = self
+            .request(
+                Method::GET,
+                &format!("/bookmarks/{bookmark_id}?includeContent=true"),
+                None,
+            )
+            .await?;
+        let screenshot = fresh["content"]["screenshotAssetId"].as_str().filter(|id| {
+            !fresh["assets"].as_array().is_some_and(|assets| {
+                assets.iter().any(|asset| {
+                    asset["id"].as_str() == Some(*id)
+                        && asset["fileName"].as_str().is_some_and(|s| !s.is_empty())
+                })
+            })
+        });
+        let summary_change = needs_summary(&fresh);
+        if screenshot.is_none() && !summary_change {
+            return Ok(false);
+        }
+        let backup = self.state_path("reddit-capture-before").join(&bookmark_id);
+        if !backup.with_extension("json").exists() {
+            write_private_json(&backup.with_extension("json"), &fresh)?;
+        }
+        if let Some(asset) = screenshot {
+            std::fs::create_dir_all(&backup)?;
+            let image = backup.join(format!("screenshot-{asset}"));
+            if !image.exists() {
+                self.backup_original_asset(asset, &image).await?;
+            }
+            self.request(
+                Method::DELETE,
+                &format!("/bookmarks/{bookmark_id}/assets/{asset}"),
+                None,
+            )
+            .await?;
+        }
+        if summary_change {
+            self.request(
+                Method::PATCH,
+                &format!("/bookmarks/{bookmark_id}"),
+                Some(&json!({"summary":replacement})),
+            )
+            .await?;
+        }
+        let updated = self
+            .request(Method::GET, &format!("/bookmarks/{bookmark_id}"), None)
+            .await?;
+        self.cache_row(&updated).await;
+        tracing::info!(bookmark=%bookmark_id, "Reddit blocked capture repaired");
+        Ok(true)
     }
     pub async fn sync_metadata(
         &self,
@@ -664,11 +997,7 @@ impl KarakeepClient {
                 .request(Method::GET, &format!("/bookmarks/{bookmark_id}"), None)
                 .await?;
         }
-        if let Some(cache) = self.index.lock().await.as_mut() {
-            for entry in cache.values_mut().filter(|entry| entry["id"] == row["id"]) {
-                *entry = updated.clone();
-            }
-        }
+        self.cache_row(&updated).await;
         tracing::info!(bookmark=%bookmark_id, "Source metadata updated");
         Ok(updated)
     }
@@ -817,7 +1146,7 @@ impl KarakeepClient {
         }
         // Karakeep limits uploads to 30/minute. Serialize and leave headroom for the UI.
         if let Some(last) = *last_upload {
-            let wait = Duration::from_millis(2200).saturating_sub(last.elapsed());
+            let wait = self.upload_interval.saturating_sub(last.elapsed());
             tokio::time::sleep(wait).await;
         }
         let part = reqwest::multipart::Part::bytes(bytes)
@@ -1373,5 +1702,264 @@ mod metadata_tests {
                 .iter()
                 .all(|r| r.method != Method::POST)
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method, path, query_param},
+    };
+    #[tokio::test]
+    async fn blocked_capture_loses_only_its_bad_screenshot_and_summary_with_a_recovery_backup() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let old = json!({"id":"bad","title":"Actual post title","note":"Keep my note","archived":true,"favourited":true,
+            "createdAt":"2020-01-01T00:00:00Z","summary":"Reddit asks to prove your humanity.",
+            "content":{"url":"https://reddit.com/r/test/comments/abc/title/","title":"Reddit - Prove your humanity",
+                "screenshotAssetId":"challenge","imageAssetId":"real-preview"},
+            "assets":[{"id":"challenge","assetType":"screenshot","fileName":null}]});
+        let mut updated = old.clone();
+        updated["content"]["screenshotAssetId"] = Value::Null;
+        updated["summary"] = "Actual post body about useful tools.".into();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/bad"))
+            .and(query_param("includeContent", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(old.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/assets/challenge"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"original screenshot".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/bookmarks/bad/assets/challenge"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/bookmarks/bad"))
+            .and(body_json(
+                json!({"summary":"Actual post body about useful tools."}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(updated.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks/bad"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(updated.clone()))
+            .with_priority(10)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            KarakeepClient::new(&server.uri(), "fake").with_state(dir.path().to_str().unwrap());
+        let metadata = json!({"title":"Actual post title","description":"Actual post body about useful tools."});
+        assert!(client.repair_reddit_capture(&old, &metadata).await.unwrap());
+        assert!(
+            !client
+                .repair_reddit_capture(&updated, &metadata)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            read_state(&client.state_path("reddit-capture-before/bad.json")).unwrap(),
+            old
+        );
+        assert_eq!(
+            std::fs::read(client.state_path("reddit-capture-before/bad/screenshot-challenge"))
+                .unwrap(),
+            b"original screenshot"
+        );
+        server.verify().await;
+    }
+    #[tokio::test]
+    async fn useful_existing_summary_is_preserved_on_a_previously_cleaned_capture() {
+        let server = MockServer::start().await;
+        let row = json!({"id":"old","summary":"A useful summary I wrote myself.",
+            "content":{"url":"https://reddit.com/r/test/comments/abc/title/","title":"Too Many Requests","screenshotAssetId":null}});
+        let client = KarakeepClient::new(&server.uri(), "fake");
+        assert!(
+            !client
+                .repair_reddit_capture(&row, &json!({"description":"Different source text"}))
+                .await
+                .unwrap()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[test]
+    fn successful_captures_are_untouched_and_rate_limit_pages_are_recognized() {
+        let row = json!({"content":{"url":"https://reddit.com/r/test/comments/abc/title/","title":"A useful post : r/test"}});
+        assert!(!blocked_reddit_capture(&row));
+        let mut row = row;
+        row["content"]["title"] = "Too Many Requests".into();
+        assert!(blocked_reddit_capture(&row));
+        row["content"]["url"] = "https://example.com/".into();
+        assert!(!blocked_reddit_capture(&row));
+        assert!(!blocked_summary("A useful summary I wrote myself."));
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method, path},
+    };
+    #[tokio::test]
+    async fn all_existing_reddit_aliases_receive_metadata_without_merging_notes_or_dates() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<Value> = [
+            (
+                "one",
+                "reddit.com",
+                "2020-01-01T00:00:00Z",
+                "First personal note",
+            ),
+            (
+                "two",
+                "www.reddit.com",
+                "2021-01-01T00:00:00Z",
+                "Second personal note",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, host, date, note)| {
+            json!({"id":id,"note":note,"createdAt":date,
+                "content":{"url":format!("https://{host}/r/test/comments/abc/title/")}})
+        })
+        .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/bookmarks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"bookmarks":rows,"nextCursor":null})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/lists/reddit/bookmarks/one"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for row in &rows {
+            let mut updated = row.clone();
+            updated["content"]["author"] = "writer".into();
+            Mock::given(method("PATCH"))
+                .and(path(format!(
+                    "/api/v1/bookmarks/{}",
+                    row["id"].as_str().unwrap()
+                )))
+                .and(body_json(json!({"author":"writer"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(updated))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client =
+            KarakeepClient::new(&server.uri(), "fake").with_state(dir.path().to_str().unwrap());
+        let item = BookmarkCreate {
+            url: "https://old.reddit.com/r/test/comments/abc/new-title/".into(),
+            metadata: json!({"author":"writer"}),
+            created_at: Some("2030-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(!client.upsert(&item, "reddit").await.unwrap().1);
+        for row in rows {
+            assert_eq!(
+                read_state(&client.state_path(&format!(
+                    "metadata-before/{}.json",
+                    row["id"].as_str().unwrap()
+                )))
+                .unwrap(),
+                row
+            );
+        }
+        server.verify().await;
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, method, path},
+    };
+    #[tokio::test]
+    async fn full_reader_import_attaches_and_recrawls_without_resaving_or_changing_dates() {
+        for pending in [false, true] {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let row = json!({"id":"saved","note":"Private notes","createdAt":"2020-01-01T00:00:00Z","archived":true,
+                "content":{"url":"https://reddit.com/r/test/comments/abc/title/","title":"Reddit - Prove your humanity",
+                    "crawlStatus":if pending {"pending"}else{"success"}},"assets":[]});
+            Mock::given(method("GET"))
+                .and(path("/api/v1/bookmarks/saved"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(row.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v1/assets"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"assetId":"reader"})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/v1/bookmarks/saved/assets"))
+                .and(body_json(
+                    json!({"id":"reader","assetType":"precrawledArchive"}),
+                ))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"reader"})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/trpc/bookmarks.recrawlBookmark"))
+                .and(body_json(json!({"json":{"bookmarkId":"saved"}})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"result":{"data":{"json":null}}})),
+                )
+                .expect(if pending { 0 } else { 1 })
+                .mount(&server)
+                .await;
+            let client =
+                KarakeepClient::new(&server.uri(), "fake").with_state(dir.path().to_str().unwrap());
+            assert!(
+                client
+                    .sync_reader(&row, "<article>Complete original message</article>")
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !client
+                    .sync_reader(&row, "<article>Complete original message</article>")
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                read_state(&client.state_path("reddit-reader-before/saved.json")).unwrap(),
+                row
+            );
+            for request in server.received_requests().await.unwrap() {
+                assert_ne!(request.method, Method::PATCH);
+                assert_ne!(request.url.path(), "/api/v1/bookmarks");
+            }
+            server.verify().await;
+        }
     }
 }

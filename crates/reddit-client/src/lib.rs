@@ -97,6 +97,7 @@ pub struct ListingChildData {
 #[derive(Debug)]
 pub struct SavedPost {
     pub preview_image: Option<String>,
+    pub reader_html: Option<String>,
     pub metadata: serde_json::Value,
     pub tags: Vec<String>,
     pub title: String,
@@ -194,7 +195,7 @@ fn saved_post(child: ListingChild) -> SavedPost {
         .as_str()
         .filter(|s| !s.trim().is_empty() && !["[removed]", "[deleted]"].contains(s))
     {
-        metadata["description"] = text.chars().take(1000).collect::<String>().into();
+        metadata["description"] = text.to_owned().into();
     }
     for (field, source) in [("datePublished", "created_utc"), ("dateModified", "edited")] {
         if let Some(seconds) = meta[source].as_f64().filter(|v| v.is_finite() && *v > 0.0) {
@@ -213,13 +214,119 @@ fn saved_post(child: ListingChild) -> SavedPost {
     {
         tags.push(flair.chars().take(100).collect());
     }
+    let url = format!("https://reddit.com{}", data.permalink);
+    let preview = preview_image(&meta);
+    let reader_html = reader_document(
+        &metadata,
+        &url,
+        meta["url_overridden_by_dest"].as_str(),
+        preview.as_deref(),
+    );
     SavedPost {
-        preview_image: preview_image(&meta),
+        reader_html,
+        preview_image: preview,
         metadata,
         tags,
         title: title.unwrap_or_else(|| "(unknown title reddit post)".into()),
-        url: format!("https://reddit.com{}", data.permalink),
+        url,
     }
+}
+
+fn reader_document(
+    metadata: &serde_json::Value,
+    url: &str,
+    outbound: Option<&str>,
+    preview: Option<&str>,
+) -> Option<String> {
+    use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
+    fn escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    }
+    fn safe_link(link: &str) -> bool {
+        reqwest::Url::parse(link).is_ok_and(|u| matches!(u.scheme(), "http" | "https" | "mailto"))
+            || link.starts_with('#')
+    }
+    let title = metadata["title"].as_str()?;
+    let body = metadata["description"].as_str().unwrap_or("");
+    let parser = Parser::new_ext(
+        body,
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS,
+    )
+    .map(|event| match event {
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: if safe_link(&dest_url) {
+                dest_url
+            } else {
+                "".into()
+            },
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            dest_url,
+            title,
+            id,
+            ..
+        }) => Event::Start(Tag::Link {
+            link_type: LinkType::Inline,
+            dest_url: if safe_link(&dest_url) {
+                dest_url
+            } else {
+                "".into()
+            },
+            title,
+            id,
+        }),
+        Event::End(TagEnd::Image) => Event::End(TagEnd::Link),
+        other => other,
+    });
+    let mut content = String::new();
+    pulldown_cmark::html::push_html(&mut content, parser);
+    if let Some(link) = outbound.filter(|s| safe_link(s)) {
+        content.push_str(&format!(
+            "<p><a href=\"{}\">{}</a></p>",
+            escape(link),
+            escape(link)
+        ));
+    }
+    let mut metas = String::new();
+    for (key, field) in [
+        ("description", "description"),
+        ("author", "author"),
+        ("og:site_name", "publisher"),
+        ("article:published_time", "datePublished"),
+        ("article:modified_time", "dateModified"),
+    ] {
+        if let Some(value) = metadata[field].as_str() {
+            metas.push_str(&format!(
+                "<meta name=\"{key}\" property=\"{key}\" content=\"{}\">",
+                escape(value)
+            ));
+        }
+    }
+    if let Some(image) = preview {
+        metas.push_str(&format!(
+            "<meta property=\"og:image\" content=\"{}\">",
+            escape(image)
+        ));
+    }
+    Some(format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title>{metas}</head><body><article><h1>{}</h1>{content}<p><a href=\"{}\">Original Reddit post</a></p></article></body></html>",
+        escape(title),
+        escape(title),
+        escape(url)
+    ))
 }
 
 /// Reddit supplies previews separately from the permalink HTML. Prefer a useful
@@ -382,5 +489,29 @@ mod metadata_tests {
         assert!(post.metadata.get("description").is_none());
         assert_eq!(post.metadata["dateModified"], "2021-01-01T00:00:00+00:00");
         assert_eq!(post.tags, vec!["Discussion"]);
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn reader_and_description_include_the_end_of_long_messages_and_escape_active_html() {
+        let body = format!(
+            "{}\n\nFINAL PARAGRAPH is present.\n\n<script>alert(1)</script>\n\n[unsafe](javascript:alert(1))",
+            "A useful paragraph. ".repeat(100)
+        );
+        let child: ListingChild =
+            serde_json::from_value(json!({"kind":"t3","data":{"title":"Actual title",
+            "permalink":"/r/test/comments/abc/title/","selftext":body,"subreddit":"test"}}))
+            .unwrap();
+        let post = saved_post(child);
+        assert_eq!(post.metadata["description"], body);
+        let html = post.reader_html.unwrap();
+        assert!(html.contains("FINAL PARAGRAPH is present."));
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("href=\"javascript:"));
+        assert!(html.contains("&lt;script&gt;"));
     }
 }

@@ -52,6 +52,7 @@ impl super::Plugin for RedditSaves {
                     .map(|post| BookmarkCreate {
                         title: post.title,
                         url: post.url,
+                        reader_html: post.reader_html,
                         metadata: post.metadata,
                         tags: post.tags,
                         // Reddit does not expose save timestamps.
@@ -90,6 +91,7 @@ impl super::Plugin for RedditSaves {
                 let bookmark = BookmarkCreate {
                     title: post.title,
                     url: post.url,
+                    reader_html: post.reader_html,
                     metadata: post.metadata,
                     tags: post.tags,
                     preview_image: if settings::get_settings().reddit.previews {
@@ -135,6 +137,7 @@ impl super::Plugin for RedditSaves {
                     let bookmark = BookmarkCreate {
                         title: post.title,
                         url: post.url,
+                        reader_html: post.reader_html,
                         metadata: post.metadata,
                         tags: post.tags,
                         preview_image: if settings::get_settings().reddit.previews {
@@ -155,6 +158,27 @@ impl super::Plugin for RedditSaves {
                 found
             );
         }
+        karakeep.retry_readers().await?;
+        let mut repaired = 0;
+        for row in karakeep.list_bookmarks(Some(&list)).await? {
+            if karakeep_client::blocked_reddit_capture(&row) {
+                // Metadata may be unavailable for a deleted post. Clear only an
+                // identifiable error-page summary and keep its saved date and notes.
+                let metadata = if row["content"]["publisher"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("Reddit · r/"))
+                {
+                    serde_json::json!({"title":row["title"],"description":row["content"]["description"]})
+                } else {
+                    serde_json::json!({})
+                };
+                repaired += usize::from(karakeep.repair_reddit_capture(&row, &metadata).await?);
+            }
+        }
+        tracing::info!(
+            "Reddit legacy capture cleanup complete (additional_repairs={})",
+            repaired
+        );
         tracing::info!(
             "Reddit sync complete (saved={}, created={}, previews_available={})",
             rank,

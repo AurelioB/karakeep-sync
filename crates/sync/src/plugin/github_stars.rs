@@ -75,6 +75,7 @@ fn repository_bookmark(repo: &Value, starred: Option<&str>) -> anyhow::Result<Bo
         metadata,
         tags,
         preview_image: repo["openGraphImageUrl"].as_str().map(str::to_owned),
+        ..Default::default()
     })
 }
 
